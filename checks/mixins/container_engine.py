@@ -48,6 +48,7 @@ class ContainerEngineMixin(rfm.RegressionMixin):
         toml_lines = [
             f'image = "{self.container_image}"',
             f'mounts = [',
+            f'"/iopsstor",',
             f'"{self.stagedir}:/rfm_workdir",',
             mounts,
             f']',

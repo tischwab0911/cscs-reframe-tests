@@ -18,7 +18,7 @@ from container_engine import ContainerEngineMixin  # noqa: E402
 class PyTorchMegatronLM_AMD(rfm.RunOnlyRegressionTest):
     num_tasks_per_node = 1
     default_num_nodes = variable(int, type(None), value=None)
-    time_limit = '30m'
+    time_limit = '60m'
     megatron_repo = variable(
         str, value='https://github.com/ROCm/Megatron-LM'
     )
@@ -26,7 +26,10 @@ class PyTorchMegatronLM_AMD(rfm.RunOnlyRegressionTest):
     # FIXME: this PR needs to be merged so that the distributed
     # checkpointinting succeeds: https://github.com/ROCm/Megatron-LM/pull/83
     megatron_release = variable(str, value='38fc830')
-    model = parameter(['llama2-7b'])
+    
+    # The LLM model to run
+    model = parameter(['llama3-8b'])
+    # model = parameter(['llama3-70b'])
     exit_interval = variable(int, value=10)
     checkpoint_dir = variable(str, type(None), value=None)
     dataset_cache_dir = variable(str, type(None), value=None)
@@ -52,20 +55,51 @@ class PyTorchMegatronLM_AMD(rfm.RunOnlyRegressionTest):
     wandb_logging = variable(bool, value=False)
     datasets = variable(str, type(None), value=None)
 
+    # 'micro_batch_size': 8
+    # 'tensor_model_parallel_size': 1
+
     configurations = {
-        'llama2-7b': {
+        'llama3-8b': {
             'num_nodes': 16,
-            'micro_batch_size': 8,
+            'micro_batch_size': 1,
+            'global_batch_size': 512, 
+            'sequence_length': 8192,
             'num_layers': 32,
             'hidden_size': 4096,
-            'ffn_hidden_size': 11008,
+            'ffn_hidden_size': 14336,
             'num_attention_heads': 32,
-            'num_kv_heads': 32,
-            'sequence_length': 4096,
-            'tensor_model_parallel_size': 4,
+            'tensor_model_parallel_size': 1,
             'pipeline_model_parallel_size': 1,
             'context_parallel_size': 1,
-            'max_position_embeddings': 32000,
+            'activation': 'swiglu',
+            'optimizer': 'adam',
+            'regularization_args': [
+                '--attention-dropout 0.0',
+                '--hidden-dropout 0.0',
+                '--weight-decay 0.1',
+                '--clip-grad 1.0',
+                '--adam-beta1 0.9',
+                '--adam-beta2 0.95',
+            ],
+            'learning_rate_args': [
+                f'--lr 1.e-4',
+                f'--min-lr 1.e-5',
+                f'--lr-decay-style cosine',
+                f'--lr-warmup-iters 1',
+            ]
+        },
+        'llama3-70b': {
+            'num_nodes': 32,
+            'micro_batch_size': 1,
+            'global_batch_size': 1024, 
+            'sequence_length': 8192,
+            'num_layers': 80,
+            'hidden_size': 8192,
+            'ffn_hidden_size': 28672,
+            'num_attention_heads': 64,
+            'tensor_model_parallel_size': 4,
+            'pipeline_model_parallel_size': 8,
+            'context_parallel_size': 1,
             'activation': 'swiglu',
             'optimizer': 'adam',
             'regularization_args': [
@@ -117,6 +151,9 @@ class PyTorchMegatronLM_AMD(rfm.RunOnlyRegressionTest):
             }
         }
 
+    # 'NCCL_DEBUG': 'INFO',
+    # 'NCCL_DEBUG_SUBSYS': 'INIT,BOOTSTRAP,ENV,TUNING',
+
     @run_after('setup')
     def set_executable_opts(self):
         model_config = self.configurations[self.model]
@@ -127,8 +164,13 @@ class PyTorchMegatronLM_AMD(rfm.RunOnlyRegressionTest):
             'MASTER_ADDR': '$(hostname)',
             'MASTER_PORT': '29400',
             'WORLD_SIZE': '$SLURM_NPROCS',
+            'AITER_ROOT_DIR': '$SCRATCH/.aiter',
+            'AITER_JIT_DIR': '$AITER_ROOT_DIR/jit',
             'MEGATRON_LM_DIR': '$PWD/Megatron-LM',
             'PYTHONPATH': '$MEGATRON_LM_DIR:$PYTHONPATH',
+            'NCCL_TUNER_CONFIG_FILE': '/iopsstor/scratch/cscs/tschwab/Hackathon/rccl-tuner/nccl_tuner.conf',
+            'NCCL_TUNER_PLUGIN': '/iopsstor/scratch/cscs/tschwab/Hackathon/rccl-tuner/libnccl-tuner.so',
+            'NCCL_TUNER_PLUGIN_SAVE_REQUESTS': 'TRUE',
             'PROJECT_NAME':
                 f'Megatron-{self.current_system.name.capitalize()}',
             'EXP_NAME': f'{self.model}-$SLURM_NNODES-nodes',
@@ -144,12 +186,24 @@ class PyTorchMegatronLM_AMD(rfm.RunOnlyRegressionTest):
             'DATASET_CACHE_DIR': (self.dataset_cache_dir or
                                   '$PWD/datasets/cache'),
             'HF_HOME': f'{self.hf_home}',
-            'OMP_NUM_THREADS': self.num_cpus_per_task // self.num_gpus_per_node
+            'OMP_NUM_THREADS': self.num_cpus_per_task // self.num_gpus_per_node,
+            'NCCL_CROSS_NIC': 1,
+            'NCCL_NET': '"AWS Libfabric"',
+            'NCCL_NET_GDR_LEVEL': 'PHB',
+            'NCCL_PROTO': '^LL128',
+            'FI_CXI_DEFAULT_CQ_SIZE': 131072,
+            'FI_CXI_DEFAULT_TX_SIZE': 32768,
+            'FI_CXI_DISABLE_HOST_REGISTER': 1,
+            'FI_MR_CACHE_MONITOR': 'userfaultfd',
+            'FI_CXI_RDZV_EAGER_SIZE': 0,
+            'FI_CXI_RDZV_GET_MIN': 0,
+            'FI_CXI_RDZV_THRESHOLD': 0,
+            'HSA_NO_SCRATCH_RECLAIM': 1,
         }
 
         if self.gemm_tuning:
             self.env_vars['TE_HIPBLASLT_TUNING_RUN_COUNT'] = 10
-            self.env_vars['TE_HIPBLASLT_TUNING_ALGO_COUNT'] = 50
+            self.env_vars['TE_HIPBLASLT_TUNING_ALGO_COUNT'] = 100
 
         if self.nccl_debug:
             self.env_vars['NCCL_DEBUG'] = 'Info'
@@ -204,11 +258,6 @@ class PyTorchMegatronLM_AMD(rfm.RunOnlyRegressionTest):
             f'--distributed-timeout-minutes 120',
         ]
 
-        group_size = (model_config['num_attention_heads'] //
-                      model_config['num_kv_heads'])
-        num_groups = model_config['num_attention_heads'] // group_size
-        global_batch_size = self.num_nodes * self.batch_size_per_node
-
         gpt_args = [
             f'--tensor-model-parallel-size '
             f'{model_config["tensor_model_parallel_size"] or self.num_gpus_per_node}',  # noqa E262
@@ -220,17 +269,16 @@ class PyTorchMegatronLM_AMD(rfm.RunOnlyRegressionTest):
             f'--hidden-size {model_config["hidden_size"]}',
             f'--ffn-hidden-size {model_config["ffn_hidden_size"]}',
             f'--num-attention-heads {model_config["num_attention_heads"]}',
-            f'--max-position-embeddings '
-            f'{model_config["max_position_embeddings"]}',
+            f'--max-position-embeddings {model_config["sequence_length"]}',
             f'--untie-embeddings-and-output-weights',
             f'--position-embedding-type rope',
             f'--no-position-embedding',
             f'--micro-batch-size {model_config["micro_batch_size"]}',
-            f'--global-batch-size {global_batch_size}',
+            f'--global-batch-size {model_config["global_batch_size"]}',
             f'--no-check-for-nan-in-loss-and-grad',
             f'--train-iters {self.training_steps}',
             f'--group-query-attention',
-            f'--num-query-groups {num_groups}',
+            f'--num-query-groups 8',
             f'--no-gradient-accumulation-fusion',
             f'--overlap-grad-reduce',
             f'--normalization RMSNorm',
@@ -350,6 +398,7 @@ class PyTorchMegatronLM_AMD(rfm.RunOnlyRegressionTest):
         ]
 
         training_cmd = (
+            f'export NCCL_TUNER_TUNING_FILE=/iopsstor/scratch/cscs/tschwab/Hackathon/logs/tuning/$SLURM_PROCID.csv \n'
             f'torchrun  '
             f'--nproc_per_node {self.num_gpus_per_node} '
             f'--nnodes {self.num_nodes} '
@@ -378,17 +427,20 @@ class PyTorchMegatronLM_AMD(rfm.RunOnlyRegressionTest):
             self.stdout, tag='throughput', conv=float
         ))
 
-
 class pytorch_image_import(rfm.RunOnlyRegressionTest):
     sourcesdir = None
     image = variable(
         str,
-        value=('docker://rocm/megatron-lm:v25.6_py312')
+        value=('docker://rocm/megatron-lm:v25.5_py312')
     )
     archive_name = 'pytorch.sqsh'
     executable = 'enroot'
     valid_systems = ['+ce']
     valid_prog_environs = ['builtin']
+
+    @run_before('run')
+    def set_job_options(self):
+        self.job.options = ['--partition=mi300']
 
     @run_before('run')
     def set_executable_opts(self):
@@ -397,7 +449,6 @@ class pytorch_image_import(rfm.RunOnlyRegressionTest):
     @sanity_function
     def assert_image_imported(self):
         return sn.path_exists(os.path.join(self.stagedir, self.archive_name))
-
 
 @rfm.simple_test
 class PyTorchMegatronLM_AMD_CE(PyTorchMegatronLM_AMD, ContainerEngineMixin):
